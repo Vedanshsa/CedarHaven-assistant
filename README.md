@@ -156,6 +156,7 @@ The root `.env.example` documents backend and optional voice settings. The front
 | `DATABASE_URL` | PostgreSQL connection string; SQLite may be used by development fallback code when the PostgreSQL configuration/driver is unavailable |
 | `UPLOAD_DIR` | Private server-side storage directory for uploaded PDFs |
 | `FRONTEND_URL` | Frontend origin used by the backend for redirects/configuration |
+| `MAX_QUESTION_CHARS` | Maximum length of each text or voice question, default `4000` characters |
 | `APP_ENV` | Set to `production` to enable production startup checks |
 | `CORS_ORIGINS` | Comma-separated allowed frontend origins |
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | LiveKit server credentials for voice rooms and agent connectivity |

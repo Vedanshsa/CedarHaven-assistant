@@ -25,6 +25,8 @@ type Chat = { id: string; title: string };
 type Message = SavedMessage;
 type UploadItem = { id: string; filename: string };
 
+const MAX_QUESTION_CHARS = 4000;
+
 export function AccountChat({ appConfig }: { appConfig: AppConfig }) {
   const [user, setUser] = useState<User | null>(null);
   const [mode, setMode] = useState<"login" | "signup">("login");
@@ -467,7 +469,7 @@ export function AccountChat({ appConfig }: { appConfig: AppConfig }) {
               {notice && <p className="mb-2 text-sm text-emerald-700">{notice}</p>}
               {error && <p role="alert" className="mb-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
               <form onSubmit={sendQuestion} className="flex items-end gap-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm transition focus-within:border-cyan-400 focus-within:ring-4 focus-within:ring-cyan-600/10">
-                <textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendQuestion(); } }} placeholder="Ask a question about your guides or PDFs…" rows={1} maxLength={800} className="max-h-40 min-h-11 flex-1 resize-y bg-transparent px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400" />
+                <textarea value={question} onChange={event => setQuestion(event.target.value)} onKeyDown={event => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendQuestion(); } }} placeholder={`Ask a question about your guides or PDFs… (up to ${MAX_QUESTION_CHARS.toLocaleString()} characters)`} rows={1} maxLength={MAX_QUESTION_CHARS} className="max-h-40 min-h-11 flex-1 resize-y bg-transparent px-3 py-3 text-sm text-slate-800 outline-none placeholder:text-slate-400" />
                 <button type="submit" disabled={busy || !question.trim()} title="Send" className="rounded-xl bg-cyan-800 p-3 text-white transition hover:bg-cyan-900 disabled:cursor-not-allowed disabled:opacity-40"><Send size={18} /></button>
               </form>
               <div className="mt-2 text-center text-[11px] text-slate-400">Enter to send · Shift+Enter for a new line</div>

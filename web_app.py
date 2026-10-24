@@ -41,7 +41,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from cedarhaven_answer import GAP_SENTENCE, NO_EVIDENCE, CedarhavenAssistant
+from cedarhaven_answer import GAP_SENTENCE, MAX_QUESTION_CHARS, NO_EVIDENCE, CedarhavenAssistant
 import account_store
 
 app = FastAPI(title="Cedarhaven Municipal Assistant", docs_url=None, redoc_url=None)
@@ -56,7 +56,7 @@ bearer = HTTPBearer(auto_error=False)
 
 
 class ChatRequest(BaseModel):
-    question: str = Field(min_length=1, max_length=1500)
+    question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
 
 
 class SignupRequest(BaseModel):
@@ -380,7 +380,7 @@ summary{cursor:pointer;color:var(--muted);font-size:.88rem;padding:4px 0}
     <form id="f">
       <div class="box">
         <label for="q" hidden>Your question</label>
-        <textarea id="q" rows="1" maxlength="800" required placeholder="Ask about the town guides"></textarea>
+        <textarea id="q" rows="1" maxlength="4000" required placeholder="Ask about the town guides"></textarea>
         <button class="send" id="send" type="submit">Ask</button>
       </div>
       <button class="reset" id="reset" type="button">Clear conversation</button>

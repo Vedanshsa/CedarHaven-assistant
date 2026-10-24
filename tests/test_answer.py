@@ -62,6 +62,15 @@ def test_verified_claim_is_answered_with_section_citation(rag):
     assert r["sources"][0]["quotes"] == ["targets an assessment within 3 business days"]
 
 
+def test_question_length_limit_is_4000_characters(rag):
+    assistant = CedarhavenAssistant(client=FakeClient(["{}"]), rag=rag)
+
+    assert assistant.answer("x" * 4000)["status"] != "empty"
+    response = assistant.answer("x" * 4001)
+    assert response["status"] == "empty"
+    assert "4000 characters or fewer" in response["answer"]
+
+
 def test_fabricated_quote_fails_closed(rag, monkeypatch):
     monkeypatch.setattr(ca, "MAX_REPAIR_ROUNDS", 0)
     bad = lambda m: json.dumps({"supported": True, "claims": [{"text": "Potholes are fixed in 1 day.", "evidence": [
