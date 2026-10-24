@@ -1,4 +1,4 @@
-"""PostgreSQL persistence for user accounts, sessions, chats, and private PDF uploads."""
+"""SQLite-first persistence with optional PostgreSQL for accounts and chat history."""
 from __future__ import annotations
 
 import os
@@ -18,7 +18,7 @@ except ImportError:  # SQLite keeps local development usable without PostgreSQL 
 
 @contextmanager
 def connection():
-    dsn = os.environ.get("DATABASE_URL", "")
+    dsn = os.environ.get("DATABASE_URL", "").strip()
     if dsn.startswith("postgresql://") or dsn.startswith("postgres://"):
         if psycopg is None:
             raise RuntimeError("Install psycopg[binary] to use PostgreSQL")
@@ -26,8 +26,23 @@ def connection():
             yield conn
         return
     import sqlite3
-    path = dsn.removeprefix("sqlite://") if dsn else os.getenv("DATABASE_PATH", "./cedarhaven.db")
-    conn = sqlite3.connect(path, timeout=15)
+    if dsn.startswith("sqlite:///"):
+        # sqlite:///./relative.db keeps a relative path; sqlite:////abs/path.db
+        # keeps the leading slash for an absolute path.
+        path = dsn.removeprefix("sqlite:///")
+    elif dsn.startswith("sqlite://"):
+        path = dsn.removeprefix("sqlite://")
+    elif dsn:
+        raise RuntimeError("DATABASE_URL must use sqlite:// or postgresql://")
+    else:
+        path = os.getenv("DATABASE_PATH", "./cedarhaven.db")
+    db_path = Path(path).expanduser()
+    if not db_path.is_absolute():
+        # API and LiveKit worker may be launched from different directories.
+        # Resolve relative SQLite paths beside this module so both use one DB.
+        db_path = Path(__file__).resolve().parent / db_path
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -49,10 +64,24 @@ def init_db():
             CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS chats (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, title TEXT NOT NULL DEFAULT 'New chat', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL, sources TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-            CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, filename TEXT NOT NULL, storage_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE, filename TEXT NOT NULL, storage_path TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
             CREATE INDEX IF NOT EXISTS messages_chat_created ON messages(chat_id, created_at);
-            CREATE INDEX IF NOT EXISTS uploads_user_created ON uploads(user_id, created_at);
             """)
+            upload_columns = {row[1] for row in conn.execute("PRAGMA table_info(uploads)")}
+            if "chat_id" not in upload_columns:
+                conn.execute("ALTER TABLE uploads ADD COLUMN chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE")
+            # Existing account-wide PDFs belong to the user's most recent chat after migration.
+            conn.execute("""
+                UPDATE uploads
+                SET chat_id = (
+                    SELECT chats.id FROM chats
+                    WHERE chats.user_id = uploads.user_id
+                    ORDER BY chats.updated_at DESC, chats.created_at DESC LIMIT 1
+                )
+                WHERE chat_id IS NULL
+                  AND EXISTS (SELECT 1 FROM chats WHERE chats.user_id = uploads.user_id)
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS uploads_chat_created ON uploads(chat_id, created_at)")
             return
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -88,11 +117,19 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS uploads (
           id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          chat_id UUID REFERENCES chats(id) ON DELETE CASCADE,
           filename TEXT NOT NULL, storage_path TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """)
+        conn.execute("ALTER TABLE uploads ADD COLUMN IF NOT EXISTS chat_id UUID REFERENCES chats(id) ON DELETE CASCADE")
+        conn.execute("""
+            UPDATE uploads AS u SET chat_id = (
+              SELECT c.id FROM chats AS c WHERE c.user_id = u.user_id
+              ORDER BY c.updated_at DESC, c.created_at DESC LIMIT 1
+            ) WHERE u.chat_id IS NULL
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS messages_chat_created ON messages(chat_id, created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS uploads_user_created ON uploads(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS uploads_chat_created ON uploads(chat_id, created_at)")
 
 
 def create_user(name, email, phone, password_hash):
@@ -194,26 +231,38 @@ def save_message(user_id: str, chat_id: str, role: str, content: str, sources=No
         return True
 
 
-def add_upload(user_id: str, filename: str, storage_path: str):
+def add_upload(user_id: str, chat_id: str, filename: str, storage_path: str):
     with connection() as conn:
         if _sqlite(conn):
-            import uuid
             upload_id = str(uuid.uuid4())
-            conn.execute("INSERT INTO uploads(id,user_id,filename,storage_path) VALUES(?,?,?,?)", (upload_id,user_id,filename,storage_path))
+            owned_chat = conn.execute("SELECT 1 FROM chats WHERE id=? AND user_id=?", (chat_id, user_id)).fetchone()
+            if not owned_chat:
+                return None
+            conn.execute("INSERT INTO uploads(id,user_id,chat_id,filename,storage_path) VALUES(?,?,?,?,?)", (upload_id,user_id,chat_id,filename,storage_path))
             return {"id": upload_id, "filename": filename}
-        return conn.execute("INSERT INTO uploads(user_id,filename,storage_path) VALUES(%s,%s,%s) RETURNING id::text AS id,filename", (user_id, filename, storage_path)).fetchone()
+        owned_chat = conn.execute("SELECT 1 FROM chats WHERE id=%s AND user_id=%s", (chat_id, user_id)).fetchone()
+        if not owned_chat:
+            return None
+        return conn.execute("INSERT INTO uploads(user_id,chat_id,filename,storage_path) VALUES(%s,%s,%s,%s) RETURNING id::text AS id,filename", (user_id, chat_id, filename, storage_path)).fetchone()
 
 
-def user_uploads(user_id: str):
+def user_uploads(user_id: str, chat_id: str):
     with connection() as conn:
-        if _sqlite(conn): return conn.execute("SELECT id,filename,storage_path FROM uploads WHERE user_id=? ORDER BY created_at DESC", (user_id,)).fetchall()
-        return conn.execute("SELECT id::text AS id,filename,storage_path FROM uploads WHERE user_id=%s ORDER BY created_at DESC", (user_id,)).fetchall()
+        if _sqlite(conn):
+            return conn.execute("SELECT id,filename,storage_path FROM uploads WHERE user_id=? AND chat_id=? ORDER BY created_at DESC", (user_id, chat_id)).fetchall()
+        return conn.execute("SELECT id::text AS id,filename,storage_path FROM uploads WHERE user_id=%s AND chat_id=%s ORDER BY created_at DESC", (user_id, chat_id)).fetchall()
 
 
-def upload_by_id(user_id: str, upload_id: str):
+def delete_upload(user_id: str, chat_id: str, upload_id: str):
     with connection() as conn:
-        if _sqlite(conn): return conn.execute("SELECT id,filename,storage_path FROM uploads WHERE id=? AND user_id=?", (upload_id,user_id)).fetchone()
-        return conn.execute("SELECT id::text AS id,filename,storage_path FROM uploads WHERE id=%s AND user_id=%s", (upload_id, user_id)).fetchone()
+        if _sqlite(conn):
+            row = conn.execute("SELECT storage_path FROM uploads WHERE id=? AND user_id=? AND chat_id=?", (upload_id, user_id, chat_id)).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM uploads WHERE id=? AND user_id=? AND chat_id=?", (upload_id, user_id, chat_id))
+            return row["storage_path"]
+        row = conn.execute("DELETE FROM uploads WHERE id=%s AND user_id=%s AND chat_id=%s RETURNING storage_path", (upload_id, user_id, chat_id)).fetchone()
+        return row["storage_path"] if row else None
 
 
 def _sqlite(conn):

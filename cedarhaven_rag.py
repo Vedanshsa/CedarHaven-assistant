@@ -372,6 +372,11 @@ class CedarhavenRAG:
         self.rrf_k = rrf_k
         self.chunks: list[Chunk] = load_chunks(self.pdf_dir)
 
+        self._build_index()
+
+    def _build_index(self) -> None:
+        """Build retrieval indexes for the current chunk collection."""
+
         self._tok = [tokenize(c.index_text) for c in self.chunks]
         self.bm25 = BM25Okapi(self._tok)
         self.vocab = {t for toks in self._tok for t in toks}
@@ -385,6 +390,18 @@ class CedarhavenRAG:
         self.oov_idf = 0.6 * float(np.median(list(self.idf.values())))
         self.tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True, min_df=1)
         self.tfidf_matrix = self.tfidf.fit_transform([c.index_text.lower() for c in self.chunks])
+
+    @classmethod
+    def from_chunks(cls, chunks: list[Chunk], pdf_dir: Path = PDF_DIR, rrf_k: int = 60) -> "CedarhavenRAG":
+        """Create a retrieval index from trusted base chunks and chat-scoped PDF chunks."""
+        if not chunks:
+            raise ValueError("At least one document chunk is required")
+        instance = cls.__new__(cls)
+        instance.pdf_dir = Path(pdf_dir)
+        instance.rrf_k = rrf_k
+        instance.chunks = chunks
+        instance._build_index()
+        return instance
 
     # -- scoring ------------------------------------------------------------ #
     def _scores(self, query: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

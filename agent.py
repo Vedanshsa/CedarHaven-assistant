@@ -17,7 +17,7 @@ from livekit.plugins import deepgram, silero  # noqa: E402
 
 import account_store  # noqa: E402
 from cedarhaven_answer import CedarhavenAssistant  # noqa: E402
-from cedarhaven_voice import CedarhavenVoiceAgent, GREETING, TOPIC  # noqa: E402
+from cedarhaven_voice import CedarhavenVoiceAgent, CONTROL_TOPIC, GREETING, TOPIC  # noqa: E402
 
 logger = logging.getLogger("cedarhaven-voice")
 AGENT_NAME = "assistant-b92"
@@ -56,25 +56,42 @@ async def entrypoint(ctx: JobContext) -> None:
     bot = ctx.proc.userdata["bot"]
 
     async def publish(payload: dict) -> None:
+        topic = CONTROL_TOPIC if payload.get("action") == "end_call" else TOPIC
         await ctx.room.local_participant.send_text(
-            json.dumps(payload, ensure_ascii=False), topic=TOPIC
+            json.dumps(payload, ensure_ascii=False), topic=topic
         )
 
-    session = AgentSession(
-        stt=deepgram.STT(
+    stt_mode = os.getenv("DEEPGRAM_STT_MODE", "flux").strip().lower()
+    if stt_mode == "flux":
+        stt = deepgram.STTv2(model=os.getenv("DEEPGRAM_STT_MODEL", "flux-general-en"))
+    elif stt_mode == "nova":
+        stt = deepgram.STT(
             model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
             language=os.getenv("DEEPGRAM_STT_LANGUAGE", "en"),
-        ),
+            smart_format=True,
+        )
+    else:
+        raise RuntimeError("DEEPGRAM_STT_MODE must be 'flux' or 'nova'.")
+
+    session = AgentSession(
+        stt=stt,
         tts=deepgram.TTS(
             model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-asteria-en"),
         ),
         vad=ctx.proc.userdata["vad"],
+        turn_detection="stt" if stt_mode == "flux" else "vad",
+        transcription_timeout=5.0,
+    )
+
+    voice_agent = CedarhavenVoiceAgent(
+        bot, publish, user_id=user_id, chat_id=chat_id
     )
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event) -> None:
         if event.is_final:
             logger.info("Deepgram returned a final transcript (%s characters)", len(event.transcript))
+            voice_agent.persist_user_transcript(event.transcript)
 
     @session.on("user_transcription_timeout")
     def on_user_transcription_timeout(event) -> None:
@@ -89,11 +106,10 @@ async def entrypoint(ctx: JobContext) -> None:
         )
 
     await session.start(
-        agent=CedarhavenVoiceAgent(
-            bot, publish, user_id=user_id, chat_id=chat_id
-        ),
+        agent=voice_agent,
         room=ctx.room,
     )
+    voice_agent.persist_assistant_transcript(GREETING)
     session.say(GREETING, allow_interruptions=True)
 
 

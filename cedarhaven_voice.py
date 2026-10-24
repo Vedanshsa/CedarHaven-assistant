@@ -20,17 +20,20 @@ import json
 import logging
 import re
 import inspect
+import threading
 from typing import Any, Awaitable, Callable
 
 from livekit.agents import Agent, StopResponse
 
 logger = logging.getLogger("cedarhaven-voice")
 TOPIC = "cedarhaven.answer"
+CONTROL_TOPIC = "cedarhaven.control"
 
-GREETING = ("Hello, I'm the Cedarhaven assistant. Ask me about service requests, by-laws, "
-            "permits or licences. I only answer from the three town guides.")
+GREETING = ("Hello, I'm the Cedarhaven document assistant. Ask about the town guides or PDFs "
+            "attached to this chat. I answer using their relevant passages.")
 
 _REPEAT_RE = re.compile(r"\b(repeat|say (that|it) again|come again|pardon|say again|one more time)\b", re.I)
+_END_CALL_RE = re.compile(r"^\s*(?:please\s+)?(?:end|hang up|disconnect)\s+(?:the\s+)?call[.! ]*$", re.I)
 _SOURCE_RE = re.compile(
     r"\b(which|what)\s+(document|guide|source|section|page)\b|\bwhere\s+(is|was|did|does)\s+(that|this|it)\b"
     r"|\bwhere\s+(that|this|it)\s+(come|came|from)\b|\bsource\b|\bcite\b|\bcitation\b", re.I)
@@ -122,6 +125,23 @@ class CedarhavenVoiceAgent(Agent):
         self.chat_id = chat_id
         self.last_payload: dict | None = None
         self.last_spoken: str = ""
+        self._transcript_lock = threading.Lock()
+
+    def persist_user_transcript(self, text: str) -> bool:
+        """Persist one final STT transcript; avoid a duplicate turn-callback write."""
+        text = (text or "").strip()
+        if not text or not self.user_id or not self.chat_id:
+            return False
+        from account_store import chat_messages, save_message
+        with self._transcript_lock:
+            history = chat_messages(self.user_id, self.chat_id)
+            if history and history[-1].get("role") == "user" and history[-1].get("content") == text:
+                return True
+            if not save_message(self.user_id, self.chat_id, "user", text):
+                logger.error("Could not save final voice transcript: bound chat is unavailable")
+                return False
+            logger.info("Saved final voice transcript to the selected chat")
+            return True
 
     # -- helpers ------------------------------------------------------------ #
     async def _say(self, text: str) -> None:
@@ -149,34 +169,45 @@ class CedarhavenVoiceAgent(Agent):
             return
         context = []
         if self.user_id and self.chat_id:
-            from account_store import chat_messages, save_message
-            context = chat_messages(self.user_id, self.chat_id)[-8:]
-            if not save_message(self.user_id, self.chat_id, "user", text):
+            from account_store import chat_messages
+            history = chat_messages(self.user_id, self.chat_id)
+            transcript_already_saved = bool(
+                history and history[-1].get("role") == "user" and history[-1].get("content") == text
+            )
+            context = (history[:-1] if transcript_already_saved else history)[-8:]
+            if not self.persist_user_transcript(text):
+                logger.error("Could not save voice transcript: bound chat is unavailable")
                 await self._say("This chat is no longer available. Please start a new chat.")
                 return
+        if _END_CALL_RE.fullmatch(text):
+            response = "Ending the call now."
+            self._save_assistant(response)
+            await self._say(response)
+            await self._safe_publish({"action": "end_call"})
+            return
         if _REPEAT_RE.search(text) and len(text.split()) <= 6:
             response = self.last_spoken or "I haven't said anything yet. Ask me a question about your documents."
-            await self._say(response)
             self._save_assistant(response)
+            await self._say(response)
             return
         if _SOURCE_RE.search(text) and len(text.split()) <= 9 and self.last_payload:
             srcs = self.last_payload["sources"]
             if srcs:
                 await self._safe_publish(self.last_payload)
                 response = sources_sentence(srcs)
-                await self._say(response)
                 self._save_assistant(response, self.last_payload.get("sources", []))
+                await self._say(response)
                 return
             response = "My last answer didn't rest on a document passage."
-            await self._say(response)
             self._save_assistant(response)
+            await self._say(response)
             return
 
         try:
             if self.user_id:
                 from account_store import user_uploads
                 docs = [{"path": row["storage_path"], "filename": row["filename"]}
-                        for row in user_uploads(self.user_id)]
+                        for row in user_uploads(self.user_id, self.chat_id)]
                 resp = await asyncio.to_thread(self.bot.answer_with_documents, text, docs, context)
             else:
                 resp = await asyncio.to_thread(self.bot.answer, text)
@@ -191,8 +222,10 @@ class CedarhavenVoiceAgent(Agent):
         await self._safe_publish(payload)  # evidence appears on screen as the voice starts
         spoken = to_spoken(resp)
         logger.info("Verified response ready; starting speech playback (status=%s)", resp.get("status"))
-        await self._say(spoken)
+        # Persist before playback so a disconnect or TTS failure cannot discard
+        # an answer that was already generated for this chat.
         self._save_assistant(resp.get("answer", spoken), resp.get("sources", []), resp.get("status"))
+        await self._say(spoken)
 
     def _save_assistant(self, text: str, sources: list[dict] | None = None, status: str | None = None) -> None:
         if not self.user_id or not self.chat_id:
@@ -200,9 +233,16 @@ class CedarhavenVoiceAgent(Agent):
         from account_store import save_message
         saved_sources = [{**source, "status": status} for source in (sources or [])]
         try:
-            save_message(self.user_id, self.chat_id, "assistant", text, saved_sources)
+            if not save_message(self.user_id, self.chat_id, "assistant", text, saved_sources):
+                logger.error("Could not save voice response: chat is not owned by the bound account")
+            else:
+                logger.info("Saved assistant voice response to the selected chat")
         except Exception:
-            logger.exception("Could not persist assistant voice response")
+            logger.exception("Could not persist voice response to the account database")
+
+    def persist_assistant_transcript(self, text: str) -> None:
+        """Persist text that the agent speaks outside of a completed user turn."""
+        self._save_assistant(text)
 
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
         text = new_message.text_content or ""

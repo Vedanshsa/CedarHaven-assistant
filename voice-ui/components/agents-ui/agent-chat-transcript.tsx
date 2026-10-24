@@ -62,9 +62,16 @@ export function AgentChatTranscript({
           const title = time.toLocaleTimeString(locale, { timeStyle: 'full' });
 
           return (
-            <Message key={id} title={title} from={messageOrigin}>
-              <MessageContent>
-                <MessageResponse>{message}</MessageResponse>
+            <Message
+              key={id}
+              title={title}
+              from={messageOrigin}
+              className="min-w-0 break-words [overflow-wrap:anywhere]"
+            >
+              <MessageContent className="min-w-0 max-w-full break-words [overflow-wrap:anywhere]">
+                <MessageResponse className="min-w-0 max-w-full break-words [overflow-wrap:anywhere]">
+                  {message}
+                </MessageResponse>
               </MessageContent>
             </Message>
           );

@@ -19,9 +19,12 @@ htmlcov/
 
 # Local databases and uploaded user documents
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
 uploads/
+!voice-ui/app/api/uploads/
+!voice-ui/app/api/uploads/**
 
 # Node / Next.js dependencies and generated output
 node_modules/

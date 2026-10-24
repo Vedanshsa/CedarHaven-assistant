@@ -84,3 +84,43 @@ def test_extractive_and_refusal_speech():
     assert "can't reach my language model" in to_spoken({"status": "extractive", "answer": "raw passages"})
     assert to_spoken({"status": "out_of_scope", "answer": "Sorry, this is currently out of my knowledge."}).startswith("Sorry")
     assert sources_sentence([]) == ""
+
+
+def test_assistant_transcript_is_saved(monkeypatch):
+    saved = []
+    monkeypatch.setattr(
+        "account_store.save_message",
+        lambda user_id, chat_id, role, content, sources=None: saved.append(
+            (user_id, chat_id, role, content, sources)
+        ) or True,
+    )
+    agent = CedarhavenVoiceAgent(
+        FakeBot(ANSWERED),
+        lambda payload: asyncio.sleep(0),
+        user_id="user-1",
+        chat_id="chat-1",
+    )
+
+    agent.persist_assistant_transcript("Hello, ask me a question.")
+
+    assert saved == [("user-1", "chat-1", "assistant", "Hello, ask me a question.", [])]
+
+
+def test_end_call_command_saves_turn_and_sends_disconnect_control(monkeypatch):
+    saved = []
+    monkeypatch.setattr("account_store.chat_messages", lambda user_id, chat_id: [])
+    monkeypatch.setattr(
+        "account_store.save_message",
+        lambda user_id, chat_id, role, content, sources=None: saved.append(
+            (role, content)
+        ) or True,
+    )
+    agent, said, sent = make()
+    agent.user_id = "user-1"
+    agent.chat_id = "chat-1"
+
+    asyncio.run(agent.handle_utterance("end call"))
+
+    assert saved == [("user", "end call"), ("assistant", "Ending the call now.")]
+    assert said == ["Ending the call now."]
+    assert sent == [{"action": "end_call"}]

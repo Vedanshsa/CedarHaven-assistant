@@ -2,9 +2,15 @@ import os
 import re
 import secrets
 import io
+import logging
 import time
 import threading
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load local configuration for SQLite/PostgreSQL selection and API settings;
+# deployment environment variables take precedence over values in .env.
+load_dotenv()
 
 try:
     from argon2 import PasswordHasher
@@ -29,7 +35,7 @@ except ImportError:
                 if scheme != "scrypt" or not hmac.compare_digest(actual, expected): raise ValueError
             except Exception:
                 raise VerifyMismatchError()
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -39,8 +45,9 @@ from cedarhaven_answer import GAP_SENTENCE, NO_EVIDENCE, CedarhavenAssistant
 import account_store
 
 app = FastAPI(title="Cedarhaven Municipal Assistant", docs_url=None, redoc_url=None)
+logger = logging.getLogger("cedarhaven-api")
 allowed_origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST"], allow_headers=["Authorization", "Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "DELETE"], allow_headers=["Authorization", "Content-Type"])
 assistant = CedarhavenAssistant()
 auth_limiter = {}
 auth_lock = threading.Lock()
@@ -178,27 +185,39 @@ def ask_chat(chat_id: str, request: ChatRequest, user=Depends(current_user)):
     if not account_store.save_message(user["id"], chat_id, "user", question):
         raise HTTPException(404, "Chat not found.")
     docs = []
-    for upload in account_store.user_uploads(user["id"]):
+    for upload in account_store.user_uploads(user["id"], chat_id):
         try:
             docs.append({"path": str(Path(upload["storage_path"]).resolve()), "filename": upload["filename"]})
         except Exception:
             pass
     try:
         response = assistant.answer_with_documents(question, docs, context=context)
+    except ValueError as exc:
+        response = {"answer": str(exc) + ". Please remove it and upload the PDF again.", "status": "error", "sources": []}
     except Exception:
-        response = {"answer": NO_EVIDENCE, "status": "out_of_scope", "sources": []}
+        logger.exception("Document answer pipeline failed")
+        response = {"answer": "Sorry, I couldn't process this question right now. Please try again.", "status": "error", "sources": []}
     persisted_sources = [{**s, "status": response.get("status")} for s in response.get("sources", [])]
     account_store.save_message(user["id"], chat_id, "assistant", response["answer"], persisted_sources)
     return response
 
 
 @app.get("/api/uploads")
-def uploads(user=Depends(current_user)):
-    return [{"id": u["id"], "filename": u["filename"]} for u in account_store.user_uploads(user["id"])]
+def uploads(chat_id: str = Query(min_length=36, max_length=36), user=Depends(current_user)):
+    if not account_store.chat_exists(user["id"], chat_id):
+        raise HTTPException(404, "Chat not found.")
+    return [{"id": u["id"], "filename": u["filename"]}
+            for u in account_store.user_uploads(user["id"], chat_id)]
 
 
 @app.post("/api/uploads")
-async def upload_pdf(request: Request, user=Depends(current_user)):
+async def upload_pdf(
+    request: Request,
+    chat_id: str = Query(min_length=36, max_length=36),
+    user=Depends(current_user),
+):
+    if not account_store.chat_exists(user["id"], chat_id):
+        raise HTTPException(404, "Chat not found.")
     from email.parser import BytesParser
     from email.policy import default
     raw = await request.body()
@@ -239,11 +258,35 @@ async def upload_pdf(request: Request, user=Depends(current_user)):
     path = user_dir / (secrets.token_hex(20) + ".pdf")
     path.write_bytes(content)
     try:
-        saved = account_store.add_upload(user["id"], Path(filename).name[:255], str(path))
+        saved = account_store.add_upload(user["id"], chat_id, Path(filename).name[:255], str(path))
     except Exception:
         path.unlink(missing_ok=True)
         raise HTTPException(503, "Could not save this document.")
     return saved
+
+
+@app.delete("/api/uploads/{upload_id}")
+def remove_upload(
+    upload_id: str,
+    chat_id: str = Query(min_length=36, max_length=36),
+    user=Depends(current_user),
+):
+    if not account_store.chat_exists(user["id"], chat_id):
+        raise HTTPException(404, "Chat not found.")
+    storage_path = account_store.delete_upload(user["id"], chat_id, upload_id)
+    if not storage_path:
+        raise HTTPException(404, "Document not found in this chat.")
+
+    upload_root = Path(os.getenv("UPLOAD_DIR", "./uploads")).resolve()
+    user_root = (upload_root / str(user["id"])).resolve()
+    document_path = Path(storage_path).resolve()
+    if document_path.is_relative_to(user_root):
+        try:
+            document_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove deleted upload from storage")
+            raise HTTPException(500, "The document record was removed, but its file could not be deleted.")
+    return {"ok": True}
 
 
 HTML = r"""<!doctype html>
