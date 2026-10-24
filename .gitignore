@@ -1,0 +1,48 @@
+# Local configuration and secrets. Keep the documented templates in Git.
+.env*
+!.env.example
+
+# Python environments, caches, and build output
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Local databases and uploaded user documents
+*.db
+*.sqlite
+*.sqlite3
+uploads/
+
+# Node / Next.js dependencies and generated output
+node_modules/
+.next/
+.turbo/
+.pnpm-store/
+out/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local tooling and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Generated evaluation output and temporary files
+evals/last_run.json
+temp/
